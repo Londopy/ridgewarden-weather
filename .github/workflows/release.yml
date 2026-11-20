@@ -26,7 +26,7 @@ jobs:
       version: ${{ steps.tag.outputs.version }}
     steps:
       # a manual run rebuilds an existing tag, so check out that tag, not main
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -75,18 +75,18 @@ jobs:
             deb: arm64
     steps:
       # Cargo.toml points at the core's client crate and ridgewarden-lightning in sibling checkouts
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.validate.outputs.tag }}
           path: ridgewarden-weather
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: Londopy/ridgewarden
           ref: ${{ env.CORE_REF }}
           path: ridgewarden
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: Londopy/ridgewarden-lightning
           path: ridgewarden-lightning
@@ -145,7 +145,7 @@ jobs:
           EOF
           dpkg-deb --root-owner-group --build "$root" "dist/ridgewarden-weather_${ver}_${{ matrix.deb }}.deb"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.arch }}
           path: ridgewarden-weather/dist/*
@@ -157,13 +157,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.validate.outputs.tag }}
           path: ridgewarden-weather
           fetch-depth: 0
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: Londopy/ridgewarden
           ref: ${{ env.CORE_REF }}
@@ -175,7 +175,7 @@ jobs:
         with:
           workspaces: ridgewarden
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: dist-*
           path: ridgewarden-weather/dist
@@ -189,7 +189,7 @@ jobs:
         run: cargo build --release -p ridgewarden
 
       # segno draws the magnet QR codes; setup-python because the runner's system pip refuses installs
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
@@ -218,7 +218,7 @@ jobs:
         run: python3 scripts/release_notes.py ${{ needs.validate.outputs.tag }} dist
 
       # publish as a draft first, so nobody downloads a half-uploaded release
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.validate.outputs.tag }}
           name: ridgewarden-weather ${{ needs.validate.outputs.version }}
