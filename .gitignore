@@ -1,0 +1,23 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Rust
+target/
+
+
+# App data from local runs
+*.db
+*.db-wal
+*.db-shm
+
+# Secrets
+.env
+*.key
+*.token

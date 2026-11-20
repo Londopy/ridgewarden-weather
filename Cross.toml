@@ -1,0 +1,5 @@
+# the core (and any sibling apps this one builds on) are checked out next to this repo,
+# outside the folder cross mounts on its own; mount the whole checkout folder too, so the
+# ../ path dependencies resolve inside cross's container
+[build.env]
+volumes = ["RIDGEWARDEN_CHECKOUTS"]

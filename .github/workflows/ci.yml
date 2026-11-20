@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+# the changelog has its own workflow (changelog.yml)
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Lint and test
+    # the agent runs on Linux (Pi or any small box), so that's where it gets tested
+    runs-on: ubuntu-latest
+    steps:
+      # this app builds against the core's shared client crate and ridgewarden-lightning's
+      # APRS parser as sibling checkouts (Cargo.toml uses path = "../ridgewarden/..."), so
+      # lay the repos out side by side
+      - uses: actions/checkout@v4
+        with:
+          path: ridgewarden-weather
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Londopy/ridgewarden
+          path: ridgewarden
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Londopy/ridgewarden-lightning
+          path: ridgewarden-lightning
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ridgewarden-weather
+
+      - name: Check formatting
+        working-directory: ridgewarden-weather
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: ridgewarden-weather
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        working-directory: ridgewarden-weather
+        run: cargo test --workspace
+
+  # the release build, run on every push so a tag never finds it broken
+  static:
+    name: Static build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      # this app builds against the core's shared client crate and ridgewarden-lightning's
+      # APRS parser as sibling checkouts (Cargo.toml uses path = "../ridgewarden/..."), so
+      # lay the repos out side by side
+      - uses: actions/checkout@v4
+        with:
+          path: ridgewarden-weather
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Londopy/ridgewarden
+          path: ridgewarden
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Londopy/ridgewarden-lightning
+          path: ridgewarden-lightning
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ridgewarden-weather
+          key: ${{ matrix.target }}
+
+      # cross brings the musl C toolchain the bundled SQLite and TLS need, for both arches
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build
+        working-directory: ridgewarden-weather
+        env:
+          RIDGEWARDEN_CHECKOUTS: ${{ github.workspace }}
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Check it is static
+        working-directory: ridgewarden-weather
+        run: |
+          f=target/${{ matrix.target }}/release/ridgewarden-weather
+          file "$f"
+          file "$f" | grep -Eq 'statically linked|static-pie linked'
