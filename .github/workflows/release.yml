@@ -26,7 +26,7 @@ jobs:
       version: ${{ steps.tag.outputs.version }}
     steps:
       # a manual run rebuilds an existing tag, so check out that tag, not main
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -75,18 +75,18 @@ jobs:
             deb: arm64
     steps:
       # Cargo.toml points at the core's client crate and ridgewarden-lightning in sibling checkouts
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.validate.outputs.tag }}
           path: ridgewarden-weather
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: Londopy/ridgewarden
           ref: ${{ env.CORE_REF }}
           path: ridgewarden
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: Londopy/ridgewarden-lightning
           path: ridgewarden-lightning
@@ -157,13 +157,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.validate.outputs.tag }}
           path: ridgewarden-weather
           fetch-depth: 0
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: Londopy/ridgewarden
           ref: ${{ env.CORE_REF }}
