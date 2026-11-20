@@ -1,0 +1,36 @@
+[package]
+name = "ridgewarden-weather"
+version = "0.1.0"
+description = "Experimental: AREDN mesh links as a weather sensor, looking for wet antennas and coastal ducting, with an OpenSense-format dataset export"
+edition = "2024"
+license = "GPL-3.0-or-later"
+authors = ["Londopy"]
+repository = "https://github.com/Londopy/ridgewarden-weather"
+homepage = "https://github.com/Londopy/ridgewarden-weather"
+rust-version = "1.88"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"] }
+clap = { version = "4.6.8", features = ["derive"] }
+# the core's shared client crate, from a sibling checkout of github.com/Londopy/ridgewarden
+ridgewarden-client = { path = "../ridgewarden/crates/ridgewarden-client" }
+# its APRS weather packet parser, the same one the dry-lightning check uses
+ridgewarden-lightning = { path = "../ridgewarden-lightning" }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "query"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+time = "0.3.45"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
+toml = "1.2.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
