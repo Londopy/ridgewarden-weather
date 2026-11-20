@@ -1,12 +1,10 @@
 # Changelog
 
-All notable changes to ridgewarden-weather are listed here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html). The section for a version is
-what appears on its GitHub release page. Validated in CI by
-[patchnotes](https://github.com/Londopy/patchnotes).
+All notable changes to ridgewarden-weather are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The section for a version is what appears on its GitHub release page. Validated in CI by [patchnotes](https://github.com/Londopy/patchnotes).
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-11-20
 
 ### Added
 
@@ -31,4 +29,5 @@ what appears on its GitHub release page. Validated in CI by
 - Link lengths on the front page; each station's nearest sounding for ducting candidates.
 - Wind from APRS reports is kept with each reading; candidates whose sites' stations reported gusts of 30 mph or more are flagged as possibly wind moving a dish, and the indicator's confidence drops.
 
-[Unreleased]: https://github.com/Londopy/ridgewarden-weather/commits/main
+[Unreleased]: https://github.com/Londopy/ridgewarden-weather/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Londopy/ridgewarden-weather/releases/tag/v0.1.0
