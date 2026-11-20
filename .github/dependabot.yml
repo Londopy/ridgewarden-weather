@@ -1,15 +1,8 @@
 version: 2
 updates:
-  - package-ecosystem: cargo
-    directory: /
-    schedule:
-      interval: weekly
-    commit-message:
-      prefix: deps
-    groups:
-      minor-and-patch:
-        update-types: [minor, patch]
-
+  # no cargo entry: this app builds against the core's client crate from a sibling
+  # checkout Dependabot can't see, so its updates always failed; crate versions follow
+  # the core repo, where Dependabot does run
   - package-ecosystem: github-actions
     directory: /
     schedule:
