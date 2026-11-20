@@ -218,7 +218,7 @@ jobs:
         run: python3 scripts/release_notes.py ${{ needs.validate.outputs.tag }} dist
 
       # publish as a draft first, so nobody downloads a half-uploaded release
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.validate.outputs.tag }}
           name: ridgewarden-weather ${{ needs.validate.outputs.version }}
