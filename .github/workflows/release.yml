@@ -1,0 +1,240 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to rebuild, e.g. v0.2.0
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # the core branch or tag this release builds its client crate (and signing tool) from
+  CORE_REF: main
+
+jobs:
+  validate:
+    name: Validate version and changelog
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      # a manual run rebuilds an existing tag, so check out that tag, not main
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - id: tag
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: Londopy/patchnotes@v2.6.0
+        with:
+          file: CHANGELOG.md
+          strict: "true"
+          check-version: ${{ steps.tag.outputs.tag }}
+
+      - name: Tag matches Cargo.toml
+        run: |
+          cargo_ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          test "$cargo_ver" = "${{ steps.tag.outputs.version }}" || {
+            echo "::error::Cargo.toml says $cargo_ver but the tag is ${{ steps.tag.outputs.tag }}"
+            exit 1
+          }
+
+      # install.sh verifies with the installed core, so releases must be signed with the
+      # key the core trusts
+      - name: Release keys are configured
+        run: |
+          test -n "${{ vars.RIDGEWARDEN_RELEASE_KEYS }}" || {
+            echo "::error::Set the RIDGEWARDEN_RELEASE_KEYS repository variable (the same public keys as the core)"
+            exit 1
+          }
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            deb: amd64
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            deb: arm64
+    steps:
+      # Cargo.toml points at the core's client crate and ridgewarden-lightning in sibling checkouts
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+          path: ridgewarden-weather
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Londopy/ridgewarden
+          ref: ${{ env.CORE_REF }}
+          path: ridgewarden
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Londopy/ridgewarden-lightning
+          path: ridgewarden-lightning
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ridgewarden-weather
+          key: ${{ matrix.target }}
+
+      # cross brings the musl C toolchain the bundled SQLite and TLS need, for both arches
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build
+        working-directory: ridgewarden-weather
+        env:
+          RIDGEWARDEN_CHECKOUTS: ${{ github.workspace }}
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package
+        working-directory: ridgewarden-weather
+        run: |
+          ver=${{ needs.validate.outputs.version }}
+          bin=target/${{ matrix.target }}/release/ridgewarden-weather
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          mkdir -p dist
+
+          name=ridgewarden-weather-v$ver-${{ matrix.arch }}-linux
+          mkdir -p "$name"
+          cp "$bin" packaging/ridgewarden-weather.service README.md LICENSE "$name/"
+          tar -czf "dist/$name.tar.gz" "$name"
+
+          root=deb/ridgewarden-weather_${ver}_${{ matrix.deb }}
+          install -D -m 755 "$bin" "$root/usr/bin/ridgewarden-weather"
+          install -D -m 644 packaging/ridgewarden-weather.service "$root/lib/systemd/system/ridgewarden-weather.service"
+          install -D -m 644 LICENSE "$root/usr/share/doc/ridgewarden-weather/copyright"
+          install -D -m 755 packaging/deb/postinst "$root/DEBIAN/postinst"
+          install -D -m 755 packaging/deb/prerm "$root/DEBIAN/prerm"
+          cat > "$root/DEBIAN/control" <<EOF
+          Package: ridgewarden-weather
+          Version: $ver
+          Architecture: ${{ matrix.deb }}
+          Maintainer: Londopy <Londopy@protonmail.com>
+          Homepage: https://github.com/Londopy/ridgewarden-weather
+          Depends: ridgewarden
+          Section: hamradio
+          Priority: optional
+          Description: experimental mesh weather sensor
+           Experimental: looks for wet-antenna and ducting signals in mesh link levels,
+           checks them against rain reports and soundings, and exports the link data
+           in the OpenSense format.
+          EOF
+          dpkg-deb --root-owner-group --build "$root" "dist/ridgewarden-weather_${ver}_${{ matrix.deb }}.deb"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: ridgewarden-weather/dist/*
+
+  release:
+    name: Sign and publish
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+          path: ridgewarden-weather
+          fetch-depth: 0
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Londopy/ridgewarden
+          ref: ${{ env.CORE_REF }}
+          path: ridgewarden
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ridgewarden
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: ridgewarden-weather/dist
+          merge-multiple: true
+
+      # the core's release-sign and verify-release, built with the release public keys
+      - name: Build the signing tool
+        working-directory: ridgewarden
+        env:
+          RIDGEWARDEN_RELEASE_KEYS: ${{ vars.RIDGEWARDEN_RELEASE_KEYS }}
+        run: cargo build --release -p ridgewarden
+
+      # segno draws the magnet QR codes; setup-python because the runner's system pip refuses installs
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # torrents first, so the signed checksums cover them too
+      - name: Torrents
+        working-directory: ridgewarden-weather
+        run: |
+          # pinned by hash: whatever this step writes into dist/ gets signed below
+          echo 'segno==1.6.6 --hash=sha256:28c7d081ed0cf935e0411293a465efd4d500704072cdb039778a2ab8736190c7' > segno.txt
+          pip install --require-hashes -r segno.txt
+          python3 scripts/release_notes.py torrents ${{ needs.validate.outputs.tag }} dist
+
+      - name: Checksums and signature
+        working-directory: ridgewarden-weather
+        env:
+          RIDGEWARDEN_RELEASE_KEY: ${{ secrets.RIDGEWARDEN_RELEASE_KEY }}
+        run: |
+          test -n "$RIDGEWARDEN_RELEASE_KEY" || { echo "::error::RIDGEWARDEN_RELEASE_KEY secret is not set"; exit 1; }
+          cp packaging/install.sh dist/
+          (cd dist && sha256sum -- * > SHA256SUMS.txt)
+          ../ridgewarden/target/release/ridgewarden release-sign dist/SHA256SUMS.txt
+          ../ridgewarden/target/release/ridgewarden verify-release dist/SHA256SUMS.txt
+
+      - name: Release page
+        working-directory: ridgewarden-weather
+        run: python3 scripts/release_notes.py ${{ needs.validate.outputs.tag }} dist
+
+      # publish as a draft first, so nobody downloads a half-uploaded release
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          name: ridgewarden-weather ${{ needs.validate.outputs.version }}
+          body_path: ridgewarden-weather/body.md
+          draft: true
+          prerelease: ${{ contains(needs.validate.outputs.tag, '-') }}
+          files: ridgewarden-weather/dist/*
+
+      - name: Publish
+        working-directory: ridgewarden-weather
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=${{ needs.validate.outputs.tag }}
+          if [[ "$tag" == *-* ]]; then
+            gh release edit "$tag" --draft=false
+          else
+            gh release edit "$tag" --draft=false --latest
+          fi

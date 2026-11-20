@@ -1,0 +1,22 @@
+[Unit]
+Description=ridgewarden-weather, an experimental mesh weather sensor
+Documentation=https://github.com/Londopy/ridgewarden-weather
+After=network-online.target ridgewarden.service
+Wants=network-online.target
+
+[Service]
+# its own user, in the core's group: it can read the core's local.token, not its station key
+User=ridgewarden-weather
+Group=ridgewarden-weather
+SupplementaryGroups=ridgewarden
+ExecStart=/usr/bin/ridgewarden-weather --config /etc/ridgewarden/weather.toml run
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/ridgewarden-weather
+
+[Install]
+WantedBy=multi-user.target

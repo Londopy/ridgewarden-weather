@@ -1,0 +1,27 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    if ! id ridgewarden-weather >/dev/null 2>&1; then
+        adduser --system --group --home /var/lib/ridgewarden-weather --no-create-home ridgewarden-weather
+    fi
+    adduser ridgewarden-weather ridgewarden >/dev/null
+    install -d -m 750 -o ridgewarden-weather -g ridgewarden-weather /var/lib/ridgewarden-weather
+    # an upgrade from when apps ran as the core's user leaves files it owned
+    chown -R ridgewarden-weather:ridgewarden-weather /var/lib/ridgewarden-weather
+    if [ ! -f /etc/ridgewarden/weather.toml ]; then
+        /usr/bin/ridgewarden-weather --config /etc/ridgewarden/weather.toml init
+    fi
+    # its webhook URLs and passphrases are for this app only, not the other apps
+    # in the ridgewarden group
+    chown root:ridgewarden-weather /etc/ridgewarden/weather.toml
+    chmod 640 /etc/ridgewarden/weather.toml
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        # start once the core is set up; until then there's nothing to follow
+        if [ -f /etc/ridgewarden/ridgewarden.toml ]; then
+            systemctl enable ridgewarden-weather >/dev/null 2>&1 || true
+            systemctl restart ridgewarden-weather || true
+        fi
+    fi
+fi
