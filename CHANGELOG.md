@@ -4,6 +4,26 @@ All notable changes to ridgewarden-weather are listed here. The format follows [
 
 ## [Unreleased]
 
+### Added
+
+- Radar rain at each site's own position: the NWS MRMS radar-only estimate of the last hour on a 1 km grid, in steps of 0.1 in, fetched hourly from NOAA's map service and again every few minutes while the hour is late. A reading of 0.1 in or more confirms candidates, keeps the hour out of the baseline and counts as a rain hour in the results; a 0 can still be drizzle, so dry hours still come from gauges. Set `[radar]` to turn it on.
+- New links are listed on the front page for two weeks after they first turn up, the 25 longest first, and ones of `long_km` (20 km) or more are flagged as long. With `links` set, the list says when a new link isn't studied.
+- A map layer of the links at `/api/links.geojson`, and each link's data as JSON at `/api/link`, with the hours it rained or was dry near either end, linked from its page.
+- `channel_width_mhz` per site and under `[export]`, exported as `channel_width`.
+- The methods page works out the rain loss on the path from ITU-R P.838-3 for the configured channel.
+
+### Changed
+
+- The baseline is a dry baseline: hours it rained at either end of a link, and the 3 after while the antennas dry (`baseline.dry_after_h`), are left out of it, so a rainy spell no longer drags the usual level down and hides the next wet antenna. An hour of day it rained at on so many days that fewer than `min_days` dry ones are left falls back to every day.
+- A link's baseline shows as ready only once every hour of day has `min_days` of history, not once any day has.
+- The results page no longer counts the drying hours after rain as dry, reads one link at a time, and works out each period at most every 10 minutes, one request at a time: a year of history no longer needs twice its size in memory.
+
+### Fixed
+
+- Rain on the path at AREDN's 5.7 to 5.9 GHz channels costs about 0.02 dB per km at 10 mm/h, not 0.01 (the 5.0 GHz figure), by ITU-R P.838-3.
+- The README and the export said AREDN nodes don't report transmit power; 4.x nodes do, it's the core's polls that don't carry it.
+- The export's `time` has the `_FillValue` the OpenSense conventions list.
+
 ## [0.1.0] - 2026-11-20
 
 ### Added
