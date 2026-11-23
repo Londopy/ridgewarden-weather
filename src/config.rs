@@ -37,6 +37,10 @@ pub struct Config {
     /// links to study, as ["node-a", "node-b"] pairs; empty means every RF link
     #[serde(default)]
     pub links: Vec<[String; 2]>,
+    /// a new link at least this long, km, is flagged: long paths near the coast are the
+    /// ones the marine layer bends
+    #[serde(default = "d_long")]
+    pub long_km: f64,
     #[serde(default)]
     pub baseline: BaselineCfg,
     #[serde(default)]
@@ -51,6 +55,8 @@ pub struct Config {
     pub nws: Option<NwsCfg>,
     #[serde(default)]
     pub soundings: Option<SoundingCfg>,
+    #[serde(default)]
+    pub radar: Option<RadarCfg>,
     #[serde(default)]
     pub export: ExportCfg,
 }
@@ -67,6 +73,10 @@ pub struct BaselineCfg {
     /// residuals are taken as medians over bins this long
     #[serde(default = "d_10")]
     pub bin_min: u32,
+    /// an hour it rained at either end of a link, and this many after it while the
+    /// antennas dry, stay out of that link's baseline
+    #[serde(default = "d_3h")]
+    pub dry_after_h: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -142,9 +152,13 @@ pub struct SiteCfg {
     /// NWS observation stations near the site, e.g. ["KSBP"]
     #[serde(default)]
     pub nws: Vec<String>,
-    /// the site's channel, for the export
+    /// the site's channel, for the export and the rain physics on the methods page
     #[serde(default)]
     pub frequency_mhz: Option<f64>,
+    /// the site's channel width, for the export: the noise floor rises 3 dB each time it
+    /// doubles, so noise and SNR only compare between links of the same width
+    #[serde(default)]
+    pub channel_width_mhz: Option<f64>,
     /// antenna height above sea level, for the export
     #[serde(default)]
     pub antenna_alt_m: Option<f64>,
@@ -186,6 +200,25 @@ pub struct SoundingCfg {
     pub max_height_m: f64,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct RadarCfg {
+    /// NOAA's image service for the NWS MRMS radar rain estimates
+    #[serde(default = "d_mrms")]
+    pub url: String,
+    /// the last-hour product for the region the mesh is in
+    #[serde(default = "d_mrms_product")]
+    pub product: String,
+}
+
+/// MRMS one-hour radar rain, by region.
+pub const RADAR_PRODUCTS: [&str; 4] = [
+    "conus_QPE_01H",
+    "alaska_QPE_01H",
+    "hawaii_QPE_01H",
+    "carib_QPE_01H",
+];
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ExportCfg {
@@ -200,6 +233,9 @@ pub struct ExportCfg {
     /// the mesh's channel, used for sites without their own frequency_mhz
     #[serde(default)]
     pub frequency_mhz: Option<f64>,
+    /// the mesh's channel width, used for sites without their own channel_width_mhz
+    #[serde(default)]
+    pub channel_width_mhz: Option<f64>,
 }
 
 fn d_core_url() -> String {
@@ -241,6 +277,15 @@ fn d_nws() -> String {
 fn d_uwyo() -> String {
     "https://weather.uwyo.edu/wsgi/sounding".into()
 }
+fn d_mrms() -> String {
+    "https://mapservices.weather.noaa.gov/raster/rest/services/obs/mrms_qpe/ImageServer".into()
+}
+fn d_mrms_product() -> String {
+    "conus_QPE_01H".into()
+}
+fn d_long() -> f64 {
+    20.0
+}
 fn d_1500() -> f64 {
     1500.0
 }
@@ -271,6 +316,9 @@ fn d_2() -> usize {
 fn d_2h() -> u32 {
     2
 }
+fn d_3h() -> u32 {
+    3
+}
 fn d_3() -> usize {
     3
 }
@@ -299,6 +347,7 @@ impl Default for BaselineCfg {
             days: 21,
             min_days: 7,
             bin_min: 10,
+            dry_after_h: 3,
         }
     }
 }
@@ -376,6 +425,10 @@ impl Config {
         if !(1..=60).contains(&b.bin_min) {
             bail!("baseline.bin_min must be between 1 and 60");
         }
+        if b.dry_after_h > 24 {
+            bail!("baseline.dry_after_h must be at most 24");
+        }
+        positive(&[("long_km", self.long_km)])?;
         let w = &self.wet;
         positive(&[
             ("wet.drop_db", w.drop_db),
@@ -448,8 +501,13 @@ impl Config {
                     s.node
                 );
             }
-            if s.frequency_mhz.is_some_and(|f| f.is_nan() || f <= 0.0) {
-                bail!("site {}: frequency_mhz must be above 0", s.node);
+            for (name, x) in [
+                ("frequency_mhz", s.frequency_mhz),
+                ("channel_width_mhz", s.channel_width_mhz),
+            ] {
+                if let Some(x) = x {
+                    positive(&[(&format!("site {}: {name}", s.node), x)])?;
+                }
             }
         }
         if let Some(a) = &self.aprs {
@@ -481,12 +539,22 @@ impl Config {
             }
             positive(&[("soundings.max_height_m", s.max_height_m)])?;
         }
-        if self
-            .export
-            .frequency_mhz
-            .is_some_and(|f| f.is_nan() || f <= 0.0)
-        {
-            bail!("export.frequency_mhz must be above 0");
+        if let Some(r) = &self.radar {
+            if !r.url.starts_with("https://") && !r.url.starts_with("http://") {
+                bail!("radar.url must be an http(s) URL");
+            }
+            if !RADAR_PRODUCTS.contains(&r.product.as_str()) {
+                bail!("radar.product must be one of {}", RADAR_PRODUCTS.join(", "));
+            }
+        }
+        let e = &self.export;
+        for (name, x) in [
+            ("export.frequency_mhz", e.frequency_mhz),
+            ("export.channel_width_mhz", e.channel_width_mhz),
+        ] {
+            if let Some(x) = x {
+                positive(&[(name, x)])?;
+            }
         }
         Ok(())
     }
@@ -519,13 +587,17 @@ impl Config {
                 .any(|[x, y]| (x == a && y == b) || (x == b && y == a))
     }
 
-    /// The APRS and NWS stations set for any of `sites`.
+    /// The rain sources for any of `sites`: the APRS and NWS stations set for them, and
+    /// with [radar] the sites themselves, since radar is read at each site's own position.
     pub fn stations_near(&self, sites: &[String]) -> Vec<String> {
         let mut v: Vec<String> = sites
             .iter()
             .filter_map(|s| self.site(s))
             .flat_map(|s| s.aprs.iter().chain(&s.nws).cloned())
             .collect();
+        if self.radar.is_some() {
+            v.extend(sites.iter().cloned());
+        }
         v.sort();
         v.dedup();
         v
@@ -570,11 +642,13 @@ gust_mph = 30.0        # gusts this strong near a site flag its candidates (dish
 links = [
   # ["tst-cuesta", "tst-madonna"],
 ]
+long_km = 20.0         # new links this long are flagged: the marine layer bends long paths
 
 [baseline]
 days = 21              # daily cycle = median of each hour of day over this many days
 min_days = 7           # days an hour of day needs before it has a baseline
 bin_min = 10           # residuals are medians over bins this long
+dry_after_h = 3        # hours of rain at either end, and this many after, stay out of it
 
 [wet]
 drop_db = 2.0          # sudden fall that counts as a drop
@@ -604,6 +678,7 @@ min_duration_min = 30
 # aprs = ["CW0000"]      # APRS weather stations (CWOP) heard over APRS-IS
 # nws = ["KSBP"]         # NWS observation stations (api.weather.gov)
 # frequency_mhz = 5745.0
+# channel_width_mhz = 10.0
 # antenna_alt_m = 790.0
 
 # Rain from APRS weather packets over APRS-IS, read-only.
@@ -623,13 +698,21 @@ min_duration_min = 30
 # stations = ["72393"]   # Vandenberg; 72493 is Oakland
 # max_height_m = 1500
 
-# Global attributes of the OpenSense export.
+# Radar rain at every site's own position: the NWS MRMS radar-only estimate of the last
+# hour on a 1 km grid, from NOAA's map service, fetched hourly. US regions only. It comes
+# in steps of 0.1 in, so it marks rain hours; dry hours still need the gauges above.
+# [radar]
+# url = "https://mapservices.weather.noaa.gov/raster/rest/services/obs/mrms_qpe/ImageServer"
+# product = "conus_QPE_01H"   # or alaska_QPE_01H, hawaii_QPE_01H, carib_QPE_01H
+
+# Global attributes of the OpenSense export, and the channel for sites without their own.
 [export]
 # title = "AREDN backbone link levels"
 # author = "N0CALL (you@example.org)"
 # institution = ""
 # licence = "CC-BY-4.0"
 # frequency_mhz = 5745.0
+# channel_width_mhz = 10.0
 "#;
 
 #[cfg(test)]
@@ -659,5 +742,32 @@ mod tests {
         .unwrap();
         c.validate().unwrap();
         assert_eq!(c.sites[0].node, "tst-cuesta");
+    }
+
+    #[test]
+    fn radar_reads_rain_at_the_sites_themselves() {
+        let site = "[aprs]\n[[site]]\nnode = \"tst-hub\"\naprs = [\"CW0001\"]";
+        let near = |c: &Config| c.stations_near(&["tst-hub".into(), "tst-n1".into()]);
+        let mut c: Config = toml::from_str(site).unwrap();
+        c.validate().unwrap();
+        assert_eq!(near(&c), ["CW0001"]);
+        let mut c: Config = toml::from_str(&format!("[radar]\n{site}")).unwrap();
+        c.validate().unwrap();
+        assert_eq!(near(&c), ["CW0001", "tst-hub", "tst-n1"]);
+        let mut c: Config = toml::from_str("[radar]\nproduct = \"conus_QPE_24H\"").unwrap();
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("radar.product")
+        );
+        let mut c: Config =
+            toml::from_str("[[site]]\nnode = \"tst-hub\"\nchannel_width_mhz = 0.0").unwrap();
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("channel_width_mhz")
+        );
     }
 }

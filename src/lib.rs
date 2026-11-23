@@ -5,18 +5,22 @@
 //! link can show: water on a site's antennas (a few dB on every link at that site, during
 //! rain) and ducting or fading (large departures on many links at once, often at night
 //! along the coast). It checks candidates against rain reports (APRS weather stations,
-//! NWS observations) and upper-air soundings, and exports the link data in the OpenSense
-//! conventions. It does not measure rain: at 5 GHz rain on the path costs far too little.
+//! NWS observations, MRMS radar) and upper-air soundings, and exports the link data in
+//! the OpenSense conventions. It does not measure rain: at 5 GHz rain on the path costs
+//! far too little.
 
 pub mod config;
 pub mod detect;
 pub mod events;
 pub mod evidence;
 pub mod export;
+pub mod links;
 pub mod netcdf;
 pub mod now;
 pub mod nws;
+pub mod p838;
 pub mod publish;
+pub mod radar;
 pub mod rain;
 pub mod results;
 pub mod series;
@@ -125,6 +129,13 @@ impl App {
         }
     }
 
+    /// Wait until the core's feed has been read to the end once.
+    pub async fn caught_up(&self) {
+        while !self.caught_up.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+
     pub fn failed(&self, source: &str, why: &str) {
         tracing::warn!("{why}");
         self.problems
@@ -145,9 +156,11 @@ impl App {
 /// A response body, refused past `max` bytes: a misbehaving server mustn't fill memory.
 pub async fn body(mut r: reqwest::Response, max: usize) -> Result<Vec<u8>> {
     let mut out = vec![];
-    while let Some(chunk) = r.chunk().await? {
+    // the URL's query can be long (radar sends every site's position), so errors leave it out
+    while let Some(chunk) = r.chunk().await.map_err(reqwest::Error::without_url)? {
         if out.len() + chunk.len() > max {
-            anyhow::bail!("{} sent more than {max} bytes", r.url());
+            let host = r.url().host_str().unwrap_or("the server");
+            anyhow::bail!("{host} sent more than {max} bytes");
         }
         out.extend_from_slice(&chunk);
     }
@@ -176,9 +189,7 @@ pub fn spawn_loops(app: Arc<App>) {
     let a = app.clone();
     tokio::spawn(async move {
         // analyze what the core holds, not the first pages of it
-        while !a.caught_up.load(Ordering::Acquire) {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
+        a.caught_up().await;
         loop {
             let cfg = a.cfg.clone();
             match tokio::task::spawn_blocking(move || analyze(&cfg)).await {
@@ -205,5 +216,6 @@ pub fn spawn_loops(app: Arc<App>) {
     });
     tokio::spawn(rain::run(app.clone()));
     tokio::spawn(nws::run(app.clone()));
+    tokio::spawn(radar::run(app.clone()));
     tokio::spawn(sounding::run(app));
 }
