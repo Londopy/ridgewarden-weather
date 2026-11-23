@@ -1,8 +1,8 @@
 //! The spec's success measure, "a statistically clear effect on at least one link class,
 //! or a well-documented negative result", computed from the stored history.
 //!
-//! Each test works on hourly residuals: an hour's median level minus the baseline for
-//! that hour, both ends of a link averaged. Two groups of hours are compared by the
+//! Each test works on hourly residuals: an hour's median level minus the dry baseline
+//! for that hour, both ends of a link averaged. Two groups of hours are compared by the
 //! difference of their means with a 95% interval (Welch's, with Student's t on the
 //! Welch-Satterthwaite degrees of freedom); the effect is clear when the interval leaves
 //! out zero. The tests over all links take one value per hour, the mean over the links,
@@ -12,7 +12,8 @@
 //! closer look, not as proof.
 //!
 //! - Rain: hours a station near either end reported rain against hours its reports were
-//!   dry, per link and over all links together.
+//!   dry (not counting the drying time after rain), per link and over all links together.
+//!   Radar adds rain hours only: its zero isn't dry, so the dry hours come from gauges.
 //! - Night: the size of departures (|residual|) at night (20-06 local) against the day
 //!   (08-18 local), over all links; ducting and fading along the coast favour the night.
 
@@ -25,7 +26,7 @@ use rusqlite::Connection;
 use crate::config::Config;
 use crate::detect::Pair;
 use crate::rain;
-use crate::series::{self, DAY, HOUR, Hour, day_of};
+use crate::series::{self, DAY, HOUR, History, day_of};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Comparison {
@@ -87,19 +88,19 @@ pub fn compare(a: &[f64], b: &[f64]) -> Option<Comparison> {
     })
 }
 
-/// Hourly residuals of one link end, keyed by hour.
-fn hourly(hours: &[Hour], cfg: &Config) -> BTreeMap<i64, f64> {
+/// Hourly residuals of one link end, keyed by hour, against its baseline.
+fn hourly(h: &History, cfg: &Config) -> BTreeMap<i64, f64> {
     let mut out = BTreeMap::new();
     let mut day = i64::MIN;
     let mut base = [None; 24];
-    for h in hours {
-        if day_of(h.hour) != day {
-            day = day_of(h.hour);
-            base = series::baseline(hours, day, &cfg.baseline);
+    for x in &h.hours {
+        if day_of(x.hour) != day {
+            day = day_of(x.hour);
+            base = series::baseline(h, day, &cfg.baseline);
         }
-        let hod = ((h.hour - day) / HOUR) as usize;
-        if let (Some(v), Some(b)) = (h.signal, base[hod]) {
-            out.insert(h.hour, v - b);
+        let hod = ((x.hour - day) / HOUR) as usize;
+        if let (Some(v), Some(b)) = (x.signal, base[hod]) {
+            out.insert(x.hour, v - b);
         }
     }
     out
@@ -112,14 +113,19 @@ fn links(
     from: i64,
     to: i64,
 ) -> Result<BTreeMap<Pair, BTreeMap<i64, f64>>> {
-    let hours = series::hours(conn, from - cfg.baseline.days as i64 * DAY, to)?;
+    let span = from - cfg.baseline.days as i64 * DAY;
+    let mut ends = series::ends(conn, span, to)?;
+    ends.retain(|e| cfg.studies(&e.0, &e.1));
+    let mut wet = series::wet(conn, cfg, &ends, span, to)?;
     let mut acc: BTreeMap<Pair, BTreeMap<i64, (f64, u32)>> = BTreeMap::new();
-    for (end, hs) in &hours {
-        if !cfg.studies(&end.0, &end.1) {
-            continue;
-        }
+    // one end at a time: a year of every link's hours is a lot to hold on a Pi
+    for end in &ends {
+        let h = History {
+            hours: series::end_hours(conn, end, span, to)?,
+            wet: wet.remove(end).unwrap_or_default(),
+        };
         let m = acc.entry(edge(&end.0, &end.1)).or_default();
-        for (t, r) in hourly(hs, cfg).range(from..to) {
+        for (t, r) in hourly(&h, cfg).range(from..to) {
             let e = m.entry(*t).or_insert((0.0, 0));
             e.0 += r;
             e.1 += 1;
@@ -135,33 +141,6 @@ fn links(
         })
         .filter(|(_, m): &(Pair, BTreeMap<i64, f64>)| !m.is_empty())
         .collect())
-}
-
-/// Hours a station said it rained, and hours it reported and it didn't. A report covers
-/// the hour before it, so it marks the hour holding its time minus half an hour.
-fn wet_and_dry(
-    conn: &Connection,
-    stations: &[String],
-    from: i64,
-    to: i64,
-) -> Result<(BTreeSet<i64>, BTreeSet<i64>)> {
-    let mut wet = BTreeSet::new();
-    let mut dry = BTreeSet::new();
-    for r in rain::reports(conn, stations, from, to + HOUR)? {
-        let t = r.ts - HOUR / 2;
-        let hour = t - t.rem_euclid(HOUR);
-        match r.wet() {
-            Some(true) => {
-                wet.insert(hour);
-            }
-            Some(false) => {
-                dry.insert(hour);
-            }
-            None => {}
-        }
-    }
-    let dry = dry.difference(&wet).copied().collect();
-    Ok((wet, dry))
 }
 
 pub struct RainResult {
@@ -211,7 +190,7 @@ pub fn compute(conn: &Connection, cfg: &Config, from: i64, to: i64) -> Result<Re
         if stations.is_empty() {
             continue;
         }
-        let (wet, dry) = wet_and_dry(conn, &stations, from, to)?;
+        let (wet, dry) = rain::wet_and_dry(conn, &stations, from, to, cfg.baseline.dry_after_h)?;
         let pick = |hs: &BTreeSet<i64>| -> Vec<f64> {
             hs.iter().filter_map(|h| rs.get(h).copied()).collect()
         };
@@ -310,15 +289,22 @@ mod tests {
         for k in 0..days * 24 {
             let hour = t0 + k * HOUR;
             let local = ((hour - 8 * HOUR).rem_euclid(DAY) / HOUR) as usize;
-            // rain every fifth day from 10 to 14 local costs 3 dB; nights swing 4 dB either
-            // way from one night to the next
-            let raining = (k / 24) % 5 == 4 && (10..14).contains(&local) && k / 24 >= 25;
+            // rain every fifth day from 10 to 14 local costs 3 dB, and 2 dB while the
+            // antennas dry after; nights swing 4 dB either way from one night to the next
+            let rain_day = (k / 24) % 5 == 4 && k / 24 >= 25;
+            let raining = rain_day && (10..14).contains(&local);
+            let drying = rain_day && (14..16).contains(&local);
             let wobble = match ((6..20).contains(&local), (k / 24) % 2) {
                 (true, _) => 0.0,
                 (false, 0) => 4.0,
                 (false, _) => -4.0,
             };
-            let v = -60.0 + wobble - if raining { 3.0 } else { 0.0 };
+            let down = match (raining, drying) {
+                (true, _) => 3.0,
+                (_, true) => 2.0,
+                _ => 0.0,
+            };
+            let v = -60.0 + wobble - down;
             for (n, nb) in [("tst-a", "tst-b"), ("tst-b", "tst-a")] {
                 conn.execute(
                     "INSERT INTO link_hours (node, neighbor, hour, n, signal) VALUES (?1, ?2, ?3, 60, ?4)",
@@ -348,6 +334,8 @@ mod tests {
         assert!(c.clear(), "{c:?}");
         assert!((c.diff + 3.0).abs() < 0.6, "{c:?}");
         assert_eq!(c.n_a, 3 * 4, "three rain days of four hours");
+        // 15 days of reports from 08 to 16 local, less the rain and the two drying hours
+        assert_eq!(c.n_b, 15 * 8 - 3 * 4 - 3 * 2, "{c:?}");
         let n = r.night.unwrap();
         assert!(n.clear() && n.diff > 3.0, "{n:?}");
         assert!(r.by_hour[2].2 > 0 && r.by_hour[2].1 > r.by_hour[12].1);

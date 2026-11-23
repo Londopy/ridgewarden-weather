@@ -99,22 +99,22 @@ impl Candidate {
     }
 }
 
-/// Binned residuals of every studied link end in [from, to).
+/// Binned residuals of every studied link end in [from, to), against its dry baseline.
 pub fn residual_ends(
     conn: &Connection,
     cfg: &Config,
     from: i64,
     to: i64,
 ) -> Result<BTreeMap<End, Vec<(i64, f64)>>> {
-    let hours = series::hours(conn, from - cfg.baseline.days as i64 * DAY, to)?;
+    let hist = series::history(conn, cfg, from - cfg.baseline.days as i64 * DAY, to)?;
+    let none = series::History::default();
     let bin = cfg.baseline.bin_min as i64 * MIN;
     let mut out = BTreeMap::new();
     for (end, s) in series::all_samples(conn, from, to)? {
         if !cfg.studies(&end.0, &end.1) {
             continue;
         }
-        let h = hours.get(&end).map_or(&[][..], Vec::as_slice);
-        let r = series::residuals(&s, h, &cfg.baseline);
+        let r = series::residuals(&s, hist.get(&end).unwrap_or(&none), &cfg.baseline);
         if !r.is_empty() {
             out.insert(end, series::bin(&r, bin));
         }
@@ -334,14 +334,25 @@ mod tests {
         c
     }
 
-    /// Polls every 5 minutes from three sites around a hub, for `days` days. Each link
-    /// has a daily cycle; from `wet_at` for three hours the hub's links lose up to 3 dB.
+    const SPOKES: [&str; 3] = ["tst-n1", "tst-n2", "tst-n3"];
+
+    /// The daily cycle every link has.
+    fn cycle(ts: i64) -> f64 {
+        let h = (ts % DAY) as f64 / HOUR as f64;
+        2.0 * (h / 24.0 * std::f64::consts::TAU).sin()
+    }
+
+    /// Polls every 5 minutes from three sites around a hub, for `days` days.
     fn history(f: &mut Fake, days: i64, wet_at: i64) {
-        let spokes = ["tst-n1", "tst-n2", "tst-n3"];
-        for k in 0..days * 288 {
-            let ts = T0 + k * 5 * MIN;
-            let h = (ts % DAY) as f64 / HOUR as f64;
-            let cycle = 2.0 * (h / 24.0 * std::f64::consts::TAU).sin();
+        polls(f, T0, T0 + days * DAY, wet_at);
+    }
+
+    /// Polls every 5 minutes in [from, to) from three sites around a hub. Each link has a
+    /// daily cycle; from `wet_at` for three hours the hub's links lose up to 3 dB.
+    fn polls(f: &mut Fake, from: i64, to: i64, wet_at: i64) {
+        for k in 0..(to - from) / (5 * MIN) {
+            let ts = from + k * 5 * MIN;
+            let cycle = cycle(ts);
             let wet = if (wet_at..wet_at + 3 * HOUR).contains(&ts) {
                 -3.0 * (1.0 - (ts - wet_at) as f64 / (3 * HOUR) as f64)
             } else {
@@ -349,7 +360,7 @@ mod tests {
             };
             let jitter = if k % 2 == 0 { 0.5 } else { -0.5 };
             let level = |base: f64, w: f64| (base + cycle + w + jitter).round();
-            let links: Vec<_> = spokes
+            let links: Vec<_> = SPOKES
                 .iter()
                 .map(|s| json!({"neighbor": s, "type": "RF", "signal": level(-60.0, wet), "noise": -95.0}))
                 .collect();
@@ -358,7 +369,7 @@ mod tests {
                 json!({"node": "tst-hub", "ok": true, "links": links}),
                 ts,
             );
-            for s in spokes {
+            for s in SPOKES {
                 f.add(
                     "node.poll",
                     json!({"node": s, "ok": true, "links": [
@@ -500,6 +511,65 @@ mod tests {
             1
         );
         assert_eq!(not_drops(vec![duct(0)], &[]).len(), 1);
+    }
+
+    fn rain_at_hub(conn: &Connection, ts: i64) {
+        crate::rain::store(
+            conn,
+            &crate::rain::Report {
+                source: "aprs".into(),
+                station: "CW0001".into(),
+                ts,
+                rain_1h_mm: Some(2.0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_rainy_spell_in_the_baseline_does_not_hide_a_wet_antenna() {
+        let mut f = fake();
+        let mut c: Config =
+            toml::from_str("[aprs]\n[[site]]\nnode = \"tst-hub\"\naprs = [\"CW0001\"]").unwrap();
+        c.validate().unwrap();
+        // afternoon rain at the hub on 12 of the 19 days before, its links 3 dB down from
+        // 14:00 to 17:00 each time: more than half the days, so a median over every hour
+        // would take that for the usual level
+        let rained = |hour: i64| (hour - T0) / DAY < 12 && (14..17).contains(&(hour % DAY / HOUR));
+        for k in 0..19 * 24 {
+            let hour = T0 + k * HOUR;
+            let down = if rained(hour) { -3.0 } else { 0.0 };
+            for s in SPOKES {
+                let other = if s == "tst-n3" { "tst-n1" } else { "tst-n3" };
+                for (node, nb, level) in [
+                    ("tst-hub", s, -60.0 + down),
+                    (s, "tst-hub", -62.0 + down),
+                    (s, other, -70.0),
+                ] {
+                    f.conn
+                        .execute(
+                            "INSERT INTO link_hours (node, neighbor, hour, n, signal)
+                             VALUES (?1, ?2, ?3, 12, ?4)",
+                            rusqlite::params![node, nb, hour, level + cycle(hour + 30 * MIN)],
+                        )
+                        .unwrap();
+                }
+            }
+            if rained(hour) {
+                rain_at_hub(&f.conn, hour + 50 * MIN);
+            }
+        }
+        // two dry days of polls, then the same afternoon rain on the third
+        let wet_at = T0 + 21 * DAY + 14 * HOUR + 3 * MIN;
+        polls(&mut f, T0 + 19 * DAY, T0 + 22 * DAY, wet_at);
+        for h in 14..17 {
+            rain_at_hub(&f.conn, T0 + 21 * DAY + h * HOUR + 50 * MIN);
+        }
+        round(&f.conn, &c, T0 + 22 * DAY).unwrap();
+        let found = list(&f.conn, 0, T0 + 22 * DAY, Some("wet")).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!((found[0].start() - wet_at).abs() <= 10 * MIN);
     }
 
     #[test]
