@@ -22,11 +22,13 @@
 //! a widespread drop, say), it is published once more with `withdrawn: true` and `end`
 //! set to that time. Readers keep the latest event per id.
 //!
-//! `weather.rain`, telemetry events with the rain readings fetched from APRS-IS and NWS:
-//! `{"v": 1, "readings": [{"station", "source": "aprs" | "nws", "at_ms", "rain_1h_mm",
-//! "rain_24h_mm", "text", "wind_dir_deg", "wind_mph", "gust_mph"}]}`, at most 200 readings per event, each reading sent once
-//! (again if a later fetch changes it). `rain_1h_mm` and `rain_24h_mm` are null when the
-//! report didn't carry them; `text` is the NWS observer's description.
+//! `weather.rain`, telemetry events with the rain readings fetched from APRS-IS, NWS and
+//! radar: `{"v": 1, "readings": [{"station", "source": "aprs" | "nws" | "mrms", "at_ms",
+//! "rain_1h_mm", "rain_24h_mm", "text", "wind_dir_deg", "wind_mph", "gust_mph"}]}`, at most
+//! 200 readings per event, each reading sent once (again if a later fetch changes it). A
+//! radar ("mrms") reading's station is the node it was read at, and it comes in steps of
+//! 0.1 in (2.54 mm), so its 0 isn't a dry hour. `rain_1h_mm` and `rain_24h_mm` are null
+//! when the report didn't carry them; `text` is the NWS observer's description.
 
 use std::collections::HashSet;
 

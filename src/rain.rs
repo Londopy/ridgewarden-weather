@@ -3,9 +3,11 @@
 //! Reports come from APRS weather stations heard over APRS-IS (most are CWOP members;
 //! the `r` field is rain in the last hour, parsed by ridgewarden-lightning's APRS code,
 //! which also gives the wind and the peak gust kept with each reading)
-//! and from NWS observations (`nws.rs`). Each report is kept, so an event can be checked
-//! against the rain around it later.
+//! and from NWS observations (`nws.rs`), and with [radar] the MRMS radar estimate at each
+//! site's own position (`radar.rs`, kept under the site's node name as the station). Each
+//! report is kept, so an event can be checked against the rain around it later.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::App;
 use crate::config::AprsCfg;
-use crate::series::DAY;
+use crate::series::{DAY, HOUR};
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS rain (
@@ -34,13 +36,14 @@ CREATE TABLE IF NOT EXISTS rain (
     -- logged to the mesh as weather.rain telemetry yet
     sent     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (source, station, ts)
-);";
+);
+CREATE INDEX IF NOT EXISTS rain_station_ts ON rain(station, ts);";
 
 const KEEP: i64 = 400 * DAY;
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Report {
-    /// "aprs" or "nws"
+    /// "aprs", "nws" or "mrms" (radar)
     pub source: String,
     pub station: String,
     pub ts: i64,
@@ -58,8 +61,9 @@ pub struct Report {
 }
 
 impl Report {
-    /// Whether it says rain fell: Some(true) for rain, Some(false) for a measured zero
-    /// with no rain in the text, None when it says nothing about rain.
+    /// Whether it says rain fell: Some(true) for rain, Some(false) for a gauge's zero with
+    /// no rain in the text, None when it says nothing about rain. Radar gives the hour in
+    /// steps of 0.1 in (2.54 mm), so its zero can be light rain or drizzle: None too.
     pub fn wet(&self) -> Option<bool> {
         let said = self.text.as_deref().map(|t| {
             let t = t.to_ascii_lowercase();
@@ -70,6 +74,7 @@ impl Report {
         match (self.rain_1h_mm, said) {
             (Some(mm), _) if mm > 0.0 => Some(true),
             (_, Some(true)) => Some(true),
+            (Some(_), _) if self.source == crate::radar::SOURCE => None,
             (Some(_), _) => Some(false),
             _ => None,
         }
@@ -184,6 +189,74 @@ pub fn reports(conn: &Connection, stations: &[String], from: i64, to: i64) -> Re
     Ok(out)
 }
 
+/// The hour a report speaks for, by its start: a report covers the hour before it, so
+/// the hour holding its time minus half an hour.
+pub fn hour_of(r: &Report) -> i64 {
+    let t = r.ts - HOUR / 2;
+    t - t.rem_euclid(HOUR)
+}
+
+/// The hours `reports` say it rained, and the `after_h` hours after each while antennas
+/// dry off.
+pub fn damp(reports: &[Report], after_h: u32) -> BTreeSet<i64> {
+    reports
+        .iter()
+        .filter(|r| r.wet() == Some(true))
+        .flat_map(|r| {
+            let h = hour_of(r);
+            (0..=after_h as i64).map(move |k| h + k * HOUR)
+        })
+        .collect()
+}
+
+/// Hours in [from, to) when any of `stations` reported rain, and the `after_h` hours
+/// after each, while antennas dry off.
+pub fn wet_hours(
+    conn: &Connection,
+    stations: &[String],
+    from: i64,
+    to: i64,
+    after_h: u32,
+) -> Result<BTreeSet<i64>> {
+    let rs = reports(conn, stations, from - after_h as i64 * HOUR, to + HOUR)?;
+    let mut out = damp(&rs, after_h);
+    out.retain(|h| (from..to).contains(h));
+    Ok(out)
+}
+
+/// Hours in [from, to) any of `stations` said it rained, and hours they reported and it
+/// didn't, less the `after_h` hours after rain while antennas dry off. Radar's zero isn't
+/// dry (see `Report::wet`), so the dry hours come from gauges.
+pub fn wet_and_dry(
+    conn: &Connection,
+    stations: &[String],
+    from: i64,
+    to: i64,
+    after_h: u32,
+) -> Result<(BTreeSet<i64>, BTreeSet<i64>)> {
+    // from a little earlier, for the drying time of rain just before `from`
+    let rs = reports(conn, stations, from - after_h as i64 * HOUR, to + HOUR)?;
+    let mut wet = BTreeSet::new();
+    let mut dry = BTreeSet::new();
+    for r in &rs {
+        match r.wet() {
+            Some(true) => {
+                wet.insert(hour_of(r));
+            }
+            Some(false) => {
+                dry.insert(hour_of(r));
+            }
+            None => {}
+        }
+    }
+    let damp = damp(&rs, after_h);
+    let inside = |h: &i64| (from..to).contains(h);
+    Ok((
+        wet.into_iter().filter(inside).collect(),
+        dry.difference(&damp).copied().filter(inside).collect(),
+    ))
+}
+
 /// The newest report from each station.
 pub fn latest(conn: &Connection) -> Result<Vec<Report>> {
     let mut st = conn.prepare(
@@ -206,6 +279,11 @@ pub enum Verdict {
 impl Verdict {
     pub fn text(&self) -> String {
         match self {
+            Verdict::Rain(r) if r.source == crate::radar::SOURCE => format!(
+                "Radar (MRMS) shows {:.1} mm in the hour at {}.",
+                r.rain_1h_mm.unwrap_or(0.0),
+                r.station
+            ),
             Verdict::Rain(r) => format!(
                 "Rain reported at {} ({}{}{}).",
                 r.station,
@@ -426,6 +504,32 @@ mod tests {
     }
 
     #[test]
+    fn wet_hours_cover_the_hour_before_a_report_and_the_drying_after() {
+        let c = db();
+        let h0 = T - T.rem_euclid(HOUR);
+        // rain reported at 14:55 is rain from 14:00; a dry report doesn't count
+        store(&c, &rep("KSBP", h0 + 55 * 60_000, Some(1.2), None)).unwrap();
+        store(&c, &rep("KSBP", h0 + 6 * HOUR, Some(0.0), Some("Cloudy"))).unwrap();
+        let st = ["KSBP".to_string()];
+        let w = wet_hours(&c, &st, h0 - DAY, h0 + DAY, 2).unwrap();
+        assert_eq!(
+            w.into_iter().collect::<Vec<_>>(),
+            [h0, h0 + HOUR, h0 + 2 * HOUR]
+        );
+        // rain just before the window still keeps its drying hours inside it
+        let w = wet_hours(&c, &st, h0 + HOUR, h0 + DAY, 2).unwrap();
+        assert_eq!(
+            w.into_iter().collect::<Vec<_>>(),
+            [h0 + HOUR, h0 + 2 * HOUR]
+        );
+        assert!(
+            wet_hours(&c, &[], h0 - DAY, h0 + DAY, 2)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn rain_beats_dry_and_silence_is_no_data() {
         assert_eq!(verdict(&[]), Verdict::NoData);
         let only_text = rep("KSBP", T, None, Some("Cloudy"));
@@ -440,5 +544,13 @@ mod tests {
             Verdict::Rain(gauge)
         );
         assert!(Verdict::Rain(said).text().contains("Light Rain"));
+        // radar's zero is under 0.1 in, which can be drizzle: no answer, unlike a gauge's
+        let radar = |mm: f64| Report {
+            source: crate::radar::SOURCE.into(),
+            rain_1h_mm: Some(mm),
+            ..rep("tst-hub", T, None, None)
+        };
+        assert_eq!(verdict(&[radar(0.0)]), Verdict::NoData);
+        assert_eq!(verdict(&[radar(2.54)]), Verdict::Rain(radar(2.54)));
     }
 }
