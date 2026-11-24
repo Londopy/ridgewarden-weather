@@ -13,25 +13,26 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
+use ridgewarden_client::ui::Color;
 use ridgewarden_client::util::{human_duration, short_time};
 use rusqlite::Connection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::detect::{self, Series};
 use crate::events;
-use crate::series::{HOUR, MIN};
+use crate::series::{End, HOUR, History, MIN};
 use crate::sounding::{self, Inversion, Sounding, TRAPPING_N_PER_KM};
 
 /// Residuals older than this say nothing about now.
-const FRESH: i64 = 30 * MIN;
+pub const FRESH: i64 = 30 * MIN;
 /// A sounding older than this is weak evidence; older than a day, none.
 const SOUNDING_FRESH: i64 = 12 * HOUR;
 const SOUNDING_USABLE: i64 = 24 * HOUR;
 /// An inversion this low caps a marine layer the backbone can reach.
 const MARINE_TOP_M: f64 = 1000.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
     Unknown,
@@ -42,7 +43,21 @@ pub enum State {
     Down,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+impl State {
+    /// The indicator's pill: its color and word.
+    pub fn pill(self) -> (Color, &'static str) {
+        match self {
+            State::Unknown => (Color::Unknown, "UNKNOWN"),
+            State::Calm => (Color::Green, "CALM"),
+            State::Some => (Color::Green, "MOSTLY CALM"),
+            State::Disturbed => (Color::Yellow, "DISTURBED"),
+            State::Sustained => (Color::Yellow, "DUCTING OR FADING"),
+            State::Down => (Color::Yellow, "WIDESPREAD DROP"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Confidence {
     None,
@@ -51,7 +66,18 @@ pub enum Confidence {
     High,
 }
 
-#[derive(Clone, Debug, Serialize)]
+impl Confidence {
+    pub fn words(self) -> &'static str {
+        match self {
+            Confidence::None => "no confidence",
+            Confidence::Low => "low confidence",
+            Confidence::Medium => "medium confidence",
+            Confidence::High => "high confidence",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Now {
     pub state: State,
     pub confidence: Confidence,
@@ -281,9 +307,16 @@ pub fn assess(
     }
 }
 
-/// The indicator from the database.
-pub fn current(conn: &Connection, cfg: &Config, now: i64) -> Result<Now> {
-    let links = detect::link_series(&events::residual_ends(conn, cfg, now - 2 * HOUR, now + 1)?);
+/// The indicator from the database, against `hist`: each link end's history over at least
+/// the `baseline.days` before the last two hours.
+pub fn current(
+    conn: &Connection,
+    cfg: &Config,
+    now: i64,
+    hist: &BTreeMap<End, History>,
+) -> Result<Now> {
+    let ends = events::residuals_against(conn, cfg, hist, now - 2 * HOUR, now + 1)?;
+    let links = detect::link_series(&ends);
     let latest = sounding::latest(conn)?.into_iter().max_by_key(|s| s.ts);
     let gust = crate::rain::strongest_gust(conn, &cfg.aprs_stations(), now - HOUR, now + 1)?;
     Ok(assess(&links, latest.as_ref(), gust.as_ref(), cfg, now))

@@ -26,6 +26,7 @@ pub mod results;
 pub mod series;
 pub mod sounding;
 pub mod strikes;
+pub mod top;
 pub mod web;
 
 use std::collections::BTreeMap;
@@ -59,6 +60,8 @@ pub struct App {
     /// the last error from each outside source, cleared when it works again
     problems: Mutex<BTreeMap<String, (i64, String)>>,
     here: Mutex<Option<String>>,
+    /// `/api/overview` as last worked out: when, and its JSON
+    overview: Mutex<Option<(i64, String)>>,
 }
 
 /// Open the app's database with every table it uses.
@@ -106,6 +109,7 @@ impl App {
                 .build()?,
             problems: Mutex::new(problems),
             here: Mutex::new(None),
+            overview: Mutex::new(None),
         })
     }
 
@@ -148,9 +152,23 @@ impl App {
         self.problems.lock().unwrap().remove(source);
     }
 
-    pub fn problems(&self) -> Vec<(i64, String)> {
-        self.problems.lock().unwrap().values().cloned().collect()
+    /// What is failing now: the source ("aprs", "nws KSBP", "analysis", ...), since when
+    /// and why.
+    pub fn problems(&self) -> Vec<(String, i64, String)> {
+        let p = self.problems.lock().unwrap();
+        p.iter()
+            .map(|(source, (at, why))| (source.clone(), *at, why.clone()))
+            .collect()
     }
+}
+
+/// A configured URL's host, for messages people see: the rest can carry a key or a long
+/// query.
+pub fn host(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| "the server".into())
 }
 
 /// A response body, refused past `max` bytes: a misbehaving server mustn't fill memory.

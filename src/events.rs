@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
+use ridgewarden_client::ui::Color;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +80,15 @@ impl Candidate {
         }
     }
 
+    /// Its pill on the pages: a color and a word.
+    pub fn pill(&self) -> (Color, &'static str) {
+        match self {
+            Candidate::Wet(_) => (Color::Yellow, "wet antenna?"),
+            Candidate::Duct(_) => (Color::Unknown, "ducting/fading?"),
+            Candidate::Front(_) => (Color::Yellow, "widespread drop?"),
+        }
+    }
+
     /// The sites it is about: the wet site, or every site with a dropping link.
     pub fn sites(&self) -> Vec<String> {
         match self {
@@ -107,6 +117,18 @@ pub fn residual_ends(
     to: i64,
 ) -> Result<BTreeMap<End, Vec<(i64, f64)>>> {
     let hist = series::history(conn, cfg, from - cfg.baseline.days as i64 * DAY, to)?;
+    residuals_against(conn, cfg, &hist, from, to)
+}
+
+/// `residual_ends` against a history already read, which must cover the `baseline.days`
+/// before `from`.
+pub fn residuals_against(
+    conn: &Connection,
+    cfg: &Config,
+    hist: &BTreeMap<End, series::History>,
+    from: i64,
+    to: i64,
+) -> Result<BTreeMap<End, Vec<(i64, f64)>>> {
     let none = series::History::default();
     let bin = cfg.baseline.bin_min as i64 * MIN;
     let mut out = BTreeMap::new();

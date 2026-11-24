@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use ridgewarden_client::util::{ms_to_rfc3339, now_ms, rfc3339_to_ms};
 use serde_json::Value;
 
@@ -70,9 +70,11 @@ async fn fetch(app: &App, cfg: &NwsCfg, station: &str, from: i64) -> Result<Vec<
         .header(reqwest::header::USER_AGENT, &cfg.user_agent)
         .header(reqwest::header::ACCEPT, "application/geo+json")
         .send()
-        .await?;
+        .await
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| crate::host(&cfg.url))?;
     if !r.status().is_success() {
-        bail!("{} answered {}", cfg.url, r.status());
+        bail!("{} answered {}", crate::host(&cfg.url), r.status());
     }
     let v: Value = serde_json::from_slice(&crate::body(r, 4_000_000).await?)?;
     Ok(parse(&v, station))

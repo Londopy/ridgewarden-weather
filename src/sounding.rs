@@ -315,9 +315,11 @@ async fn fetch(app: &App, cfg: &SoundingCfg, station: &str, ts: i64) -> Result<S
             ("type", "TEXT:LIST"),
         ])
         .send()
-        .await?;
+        .await
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| crate::host(&cfg.url))?;
     if !r.status().is_success() {
-        bail!("{} answered {}", cfg.url, r.status());
+        bail!("{} answered {}", crate::host(&cfg.url), r.status());
     }
     let s = parse(&String::from_utf8_lossy(&crate::body(r, 2_000_000).await?))?;
     if s.station != station || s.ts != ts {

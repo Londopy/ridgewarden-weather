@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use ridgewarden_client::util::now_ms;
 use ridgewarden_lightning::geo::LatLon;
 use serde_json::{Value, json};
@@ -139,9 +139,10 @@ async fn fetch(
         .send()
         .await
         // the query holds every site's position: too long to show with the error
-        .map_err(reqwest::Error::without_url)?;
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| crate::host(&cfg.url))?;
     if !r.status().is_success() {
-        bail!("{} answered {}", cfg.url, r.status());
+        bail!("{} answered {}", crate::host(&cfg.url), r.status());
     }
     let v: Value = serde_json::from_slice(&crate::body(r, 1_000_000).await?)?;
     let nodes: Vec<String> = places.iter().map(|(n, _)| n.clone()).collect();
@@ -366,17 +367,33 @@ mod tests {
             |_| json!({"error": {"code": 400, "message": "Invalid or missing input parameters."}}),
         )
         .await;
-        let e = sample(&http, &cfg(url), &places, NOW).await.unwrap_err();
+        let e = sample(&http, &cfg(url.clone()), &places, NOW)
+            .await
+            .unwrap_err();
         assert!(e.to_string().contains("Invalid or missing"), "{e}");
+        // a configured path can hold a key; the pages and /api/overview show the error
+        let e = sample(&http, &cfg(format!("{url}/key-abc123")), &places, NOW)
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), "127.0.0.1 answered 404 Not Found");
         // nothing listening: the error doesn't carry the URL and every site's position
         let gone = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap();
-        let e = sample(&http, &cfg(format!("http://{gone}")), &places, NOW)
-            .await
-            .unwrap_err();
+        let e = sample(
+            &http,
+            &cfg(format!("http://{gone}/key-abc123")),
+            &places,
+            NOW,
+        )
+        .await
+        .unwrap_err();
         let e = format!("{e:#}");
-        assert!(!e.contains("geometry") && !e.contains("120.6"), "{e}");
+        assert!(e.starts_with("127.0.0.1: "), "{e}");
+        assert!(
+            !e.contains("key-abc123") && !e.contains("geometry") && !e.contains("120.6"),
+            "{e}"
+        );
     }
 }

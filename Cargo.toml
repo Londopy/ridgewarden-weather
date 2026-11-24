@@ -13,8 +13,9 @@ rust-version = "1.88"
 anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"] }
 clap = { version = "4.6.8", features = ["derive"] }
-# the core's shared client crate, from a sibling checkout of github.com/Londopy/ridgewarden
-ridgewarden-client = { path = "../ridgewarden/crates/ridgewarden-client" }
+# the core's shared client crate, from a sibling checkout of github.com/Londopy/ridgewarden;
+# `tui` is the terminal view `top` is built on
+ridgewarden-client = { path = "../ridgewarden/crates/ridgewarden-client", features = ["tui"] }
 # its APRS weather packet parser, the same one the dry-lightning check uses
 ridgewarden-lightning = { path = "../ridgewarden-lightning" }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "query"] }

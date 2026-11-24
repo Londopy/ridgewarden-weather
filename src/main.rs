@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -7,7 +8,7 @@ use ridgewarden_client::util::now_ms;
 
 use ridgewarden_weather::config::{Config, EXAMPLE};
 use ridgewarden_weather::series::DAY;
-use ridgewarden_weather::{App, export, nws, open, rain, sounding, spawn_loops, web};
+use ridgewarden_weather::{App, export, nws, open, rain, sounding, spawn_loops, top, web};
 
 #[derive(Parser)]
 #[command(
@@ -60,17 +61,31 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Watch it live in the terminal: the marine layer, each studied link against its
+    /// baseline, candidates, rain sources and new links
+    Top {
+        /// where the app answers; reads its API, not the config
+        #[arg(long, default_value = "http://127.0.0.1:8801")]
+        url: String,
+        /// seconds between reads
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=600))]
+        every: u64,
+    },
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ridgewarden_weather=info,ridgewarden_client=info".into()),
-        )
-        .init();
     let cli = Cli::parse();
+    // top draws the whole terminal, so a log line would land in the middle of it
+    if !matches!(cli.cmd, Cmd::Top { .. }) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "ridgewarden_weather=info,ridgewarden_client=info".into()),
+            )
+            .init();
+    }
     match cli.cmd {
+        Cmd::Top { url, every } => top::run(&url, Duration::from_secs(every)),
         Cmd::Init => {
             if cli.config.exists() {
                 bail!(

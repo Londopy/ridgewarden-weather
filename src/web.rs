@@ -17,14 +17,16 @@ use ridgewarden_client::svg::{Chart, Line};
 use ridgewarden_client::ui::{Color, Page, pill};
 use ridgewarden_client::util::{esc, human_duration, ms_to_rfc3339, norm_node, now_ms, short_time};
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::App;
 use crate::config::Config;
+use crate::detect::Pair;
 use crate::events::{self, Candidate};
 use crate::evidence;
 use crate::links::{self, Seen};
-use crate::now::{self, Confidence, Now, State as NowState};
+use crate::now::{self, Now};
 use crate::rain::{self, Report};
 use crate::results;
 use crate::series::{self, DAY, End, HOUR, MIN};
@@ -42,6 +44,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/results", get(results_page))
         .route("/api/events", get(events_json))
         .route("/api/now", get(now_json))
+        .route("/api/overview", get(overview_json))
         .route("/api/link", get(link_json))
         .route("/api/links.geojson", get(links_geojson))
         .route("/healthz", get(|| async { "ok" }))
@@ -83,7 +86,7 @@ fn page(here: &str, active: &str, title: &str, body: &str) -> Html<String> {
 }
 
 /// Percent-encode a query value.
-fn enc(s: &str) -> String {
+pub fn enc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
@@ -119,10 +122,22 @@ struct EndStatus {
     residual: Option<f64>,
 }
 
-fn end_status(conn: &Connection, cfg: &Config, now: i64) -> anyhow::Result<Vec<EndStatus>> {
-    let recent = series::all_samples(conn, now - DAY, now + 1)?;
+type Histories = BTreeMap<End, series::History>;
+
+/// Every link end's history behind the baselines of the last day: what `end_status` and
+/// `now::current` both need, read once.
+fn recent_history(conn: &Connection, cfg: &Config, now: i64) -> anyhow::Result<Histories> {
     let from = now - (cfg.baseline.days as i64 + 1) * DAY;
-    let hist = series::history(conn, cfg, from, now + 1)?;
+    series::history(conn, cfg, from, now + 1)
+}
+
+fn end_status(
+    conn: &Connection,
+    cfg: &Config,
+    now: i64,
+    hist: &Histories,
+) -> anyhow::Result<Vec<EndStatus>> {
+    let recent = series::all_samples(conn, now - DAY, now + 1)?;
     let none = series::History::default();
     let today = series::day_of(now);
     let mut out: Vec<EndStatus> = recent
@@ -147,9 +162,10 @@ fn end_status(conn: &Connection, cfg: &Config, now: i64) -> anyhow::Result<Vec<E
     Ok(out)
 }
 
+/// A candidate's heading, as plain text.
 fn candidate_title(cfg: &Config, c: &Candidate) -> String {
     match c {
-        Candidate::Wet(w) => format!("Wet antenna? at {}", esc(&cfg.label(&w.site))),
+        Candidate::Wet(w) => format!("Wet antenna? at {}", cfg.label(&w.site)),
         Candidate::Duct(d) => format!("Ducting or fading? on {} links", d.links.len()),
         Candidate::Front(f) => format!(
             "Widespread drop? {} links at {} sites",
@@ -160,11 +176,8 @@ fn candidate_title(cfg: &Config, c: &Candidate) -> String {
 }
 
 fn candidate_pill(c: &Candidate) -> String {
-    match c {
-        Candidate::Wet(_) => pill(Color::Yellow, "wet antenna?"),
-        Candidate::Duct(_) => pill(Color::Unknown, "ducting/fading?"),
-        Candidate::Front(_) => pill(Color::Yellow, "widespread drop?"),
-    }
+    let (color, word) = c.pill();
+    pill(color, word)
 }
 
 async fn overview(State(app): State<Arc<App>>) -> Result<Html<String>, Fail> {
@@ -174,8 +187,9 @@ async fn overview(State(app): State<Arc<App>>) -> Result<Html<String>, Fail> {
     let a = app.clone();
     let (ends, ind, seen) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let db = a.db();
-        let ends = end_status(&db, &a.cfg, now)?;
-        let ind = now::current(&db, &a.cfg, now)?;
+        let hist = recent_history(&db, &a.cfg, now)?;
+        let ends = end_status(&db, &a.cfg, now, &hist)?;
+        let ind = now::current(&db, &a.cfg, now, &hist)?;
         let seen = links::seen(&db, &a.cfg, now)?;
         Ok((ends, ind, seen))
     })
@@ -198,7 +212,7 @@ async fn overview(State(app): State<Arc<App>>) -> Result<Html<String>, Fail> {
                 b,
                 "<li>{} {} <span class=\"mute small\">{}</span></li>",
                 candidate_pill(c),
-                candidate_title(cfg, c),
+                esc(&candidate_title(cfg, c)),
                 esc(&when(cfg, c.start()))
             );
         }
@@ -276,12 +290,18 @@ async fn overview(State(app): State<Arc<App>>) -> Result<Html<String>, Fail> {
     Ok(page(&here, "/", "Now", &b))
 }
 
-fn new_links_html(cfg: &Config, seen: &[Seen]) -> String {
+/// The new links, longest first.
+fn new_longest(seen: &[Seen]) -> Vec<&Seen> {
     let mut new: Vec<&Seen> = seen.iter().filter(|l| l.new).collect();
+    new.sort_by(|x, y| y.km.unwrap_or(0.0).total_cmp(&x.km.unwrap_or(0.0)));
+    new
+}
+
+fn new_links_html(cfg: &Config, seen: &[Seen]) -> String {
+    let new = new_longest(seen);
     if new.is_empty() {
         return String::new();
     }
-    new.sort_by(|x, y| y.km.unwrap_or(0.0).total_cmp(&x.km.unwrap_or(0.0)));
     let mut b = format!(
         "<h2>New links</h2><p class=\"mute small\">First heard in the last two weeks, longest \
          first. Paths of {:.1} km or more are the ones the marine layer bends, so they are \
@@ -326,23 +346,11 @@ fn new_links_html(cfg: &Config, seen: &[Seen]) -> String {
 const NEW_SHOWN: usize = 25;
 
 fn indicator_html(n: &Now) -> String {
-    let (color, word) = match n.state {
-        NowState::Unknown => (Color::Unknown, "UNKNOWN"),
-        NowState::Calm => (Color::Green, "CALM"),
-        NowState::Some => (Color::Green, "MOSTLY CALM"),
-        NowState::Disturbed => (Color::Yellow, "DISTURBED"),
-        NowState::Sustained => (Color::Yellow, "DUCTING OR FADING"),
-        NowState::Down => (Color::Yellow, "WIDESPREAD DROP"),
-    };
-    let conf = match n.confidence {
-        Confidence::None => "no confidence",
-        Confidence::Low => "low confidence",
-        Confidence::Medium => "medium confidence",
-        Confidence::High => "high confidence",
-    };
+    let (color, word) = n.state.pill();
     let mut b = format!(
-        "<h2>Marine layer now</h2><p>{} <span class=\"mute small\">{conf}</span></p><p>{}</p><ul class=\"plain small\">",
+        "<h2>Marine layer now</h2><p>{} <span class=\"mute small\">{}</span></p><p>{}</p><ul class=\"plain small\">",
         pill(color, word),
+        n.confidence.words(),
         esc(&n.verdict)
     );
     for e in &n.evidence {
@@ -384,35 +392,58 @@ fn report_text(r: &Report) -> String {
     parts.join(", ")
 }
 
-/// The radar's newest hour as one row: a row per site would bury the gauges.
-fn radar_row(cfg: &Config, radar: &[&Report]) -> String {
-    let Some(newest) = radar.iter().map(|r| r.ts).max() else {
-        return String::new();
-    };
-    let hour: Vec<&Report> = radar.iter().filter(|r| r.ts == newest).copied().collect();
+/// The radar's newest hour over every site.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RadarHour {
+    /// when the hour ended
+    pub at_ms: i64,
+    pub sites: usize,
+    /// sites with 0.1 in (2.5 mm) or more, and the most at any of them
+    pub wet_sites: usize,
+    pub max_mm: Option<f64>,
+}
+
+fn radar_hour(radar: &[&Report]) -> Option<RadarHour> {
+    let at_ms = radar.iter().map(|r| r.ts).max()?;
+    let hour: Vec<&Report> = radar.iter().filter(|r| r.ts == at_ms).copied().collect();
     let wet: Vec<f64> = hour
         .iter()
         .filter(|r| r.wet() == Some(true))
         .filter_map(|r| r.rain_1h_mm)
         .collect();
-    let sites = |n: usize| format!("{n} site{}", if n == 1 { "" } else { "s" });
-    let said = if wet.is_empty() {
-        format!(
+    Some(RadarHour {
+        at_ms,
+        sites: hour.len(),
+        wet_sites: wet.len(),
+        max_mm: wet.into_iter().reduce(f64::max),
+    })
+}
+
+/// "1 site", "7 sites"
+pub fn sites(n: usize) -> String {
+    format!("{n} site{}", if n == 1 { "" } else { "s" })
+}
+
+/// The radar's newest hour as one row: a row per site would bury the gauges.
+fn radar_row(cfg: &Config, radar: &[&Report]) -> String {
+    let Some(h) = radar_hour(radar) else {
+        return String::new();
+    };
+    let said = match h.max_mm {
+        None => format!(
             "under 0.1 in (2.5 mm) at {}, which can still be light rain",
-            sites(hour.len())
-        )
-    } else {
-        format!(
-            "rain at {} of {}, up to {:.1} mm in the hour",
-            wet.len(),
-            sites(hour.len()),
-            wet.iter().copied().fold(0.0, f64::max)
-        )
+            sites(h.sites)
+        ),
+        Some(mm) => format!(
+            "rain at {} of {}, up to {mm:.1} mm in the hour",
+            h.wet_sites,
+            sites(h.sites)
+        ),
     };
     format!(
         "<tr><td>{}</td><td>radar (MRMS), at each site</td><td>{}</td><td>{}</td></tr>",
-        sites(hour.len()),
-        esc(&when(cfg, newest)),
+        sites(h.sites),
+        esc(&when(cfg, h.at_ms)),
         esc(&said)
     )
 }
@@ -467,7 +498,7 @@ fn sources_html(app: &App, b: &mut String) -> Result<(), Fail> {
     let problems = app.problems();
     if !problems.is_empty() {
         b.push_str("<ul class=plain>");
-        for (at, why) in problems {
+        for (_, at, why) in problems {
             let _ = write!(
                 b,
                 "<li>{} {} <span class=\"mute small\">{}</span></li>",
@@ -479,6 +510,277 @@ fn sources_html(app: &App, b: &mut String) -> Result<(), Fail> {
         b.push_str("</ul>");
     }
     Ok(())
+}
+
+/// What the front page shows, as `/api/overview` returns it; `top` draws from it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Overview {
+    pub generated_ms: i64,
+    /// this site's node, "" before the core has polled it
+    pub here: String,
+    /// each site's label, by node
+    pub labels: BTreeMap<String, String>,
+    /// when detection last finished; None before its first round
+    pub analyzed_ms: Option<i64>,
+    /// `publish` in the config, and whether candidates really go out
+    pub publish: bool,
+    pub publishing: bool,
+    /// a residual this far from zero is off the usual level (`duct.departure_db`)
+    pub departure_db: f64,
+    /// days every hour of day needs before a link has a baseline
+    pub min_days: u32,
+    pub now: Now,
+    /// the studied links heard in the last day
+    pub links: Vec<LinkRow>,
+    /// the longest new links, and how many more there are
+    pub new_links: Vec<NewLink>,
+    pub new_more: usize,
+    /// candidates in the last 7 days, newest first
+    pub candidates: Vec<CandidateRow>,
+    /// every rain gauge set for a site or heard from, with its newest report
+    pub gauges: Vec<Gauge>,
+    pub radar_on: bool,
+    pub radar: Option<RadarHour>,
+    /// every sounding station set or heard from, with its newest sounding
+    pub soundings: Vec<SoundingRow>,
+    /// what is failing now
+    pub problems: Vec<Problem>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LinkRow {
+    pub a: String,
+    pub b: String,
+    pub length_km: Option<f64>,
+    pub ends: Vec<EndRow>,
+}
+
+/// What `node` hears from `hears`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EndRow {
+    pub node: String,
+    pub hears: String,
+    /// samples in the last day, the newest one's time and the usual gap between them
+    pub samples: usize,
+    pub last_ms: i64,
+    pub every_ms: Option<i64>,
+    /// days of history at its least covered hour of day
+    pub baseline_days: usize,
+    /// the newest sample minus its baseline
+    pub residual_db: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NewLink {
+    pub a: String,
+    pub b: String,
+    pub length_km: Option<f64>,
+    pub first_ms: i64,
+    pub long: bool,
+    pub studied: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CandidateRow {
+    pub candidate: Candidate,
+    pub title: String,
+    pub summary: String,
+    /// the evidence, in sentences
+    pub evidence: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Gauge {
+    pub station: String,
+    /// "aprs" or "nws"
+    pub source: String,
+    /// the sites it is set for
+    pub sites: Vec<String>,
+    /// the newest report's time and what it said; None before the first
+    pub at_ms: Option<i64>,
+    pub said: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SoundingRow {
+    pub station: String,
+    pub at_ms: Option<i64>,
+    pub summary: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Problem {
+    /// "aprs", "radar", "nws <station>", "sounding <station>", "analysis" or "publish"
+    pub source: String,
+    pub at_ms: i64,
+    pub what: String,
+}
+
+fn overview_data(app: &App, now: i64) -> anyhow::Result<Overview> {
+    let cfg = &app.cfg;
+    let db = app.db();
+    let hist = recent_history(&db, cfg, now)?;
+    let ends = end_status(&db, cfg, now, &hist)?;
+    let pos = evidence::positions(&db, ends.iter().flat_map(|e| [&e.end.0, &e.end.1]))?;
+    let mut rows: BTreeMap<Pair, LinkRow> = BTreeMap::new();
+    for e in ends {
+        let (a, b) = edge(&e.end.0, &e.end.1);
+        let length_km = match (pos.get(&a), pos.get(&b)) {
+            (Some(x), Some(y)) => Some(evidence::round(distance_km(*x, *y), 1)),
+            _ => None,
+        };
+        let row = rows
+            .entry((a.clone(), b.clone()))
+            .or_insert_with(|| LinkRow {
+                a,
+                b,
+                length_km,
+                ends: vec![],
+            });
+        row.ends.push(EndRow {
+            samples: e.samples,
+            last_ms: e.last,
+            every_ms: e.every,
+            baseline_days: e.baseline_days,
+            residual_db: e.residual.map(|r| evidence::round(r, 2)),
+            node: e.end.0,
+            hears: e.end.1,
+        });
+    }
+    let seen = links::seen(&db, cfg, now)?;
+    let new = new_longest(&seen);
+    let candidates = events::list(&db, now - 7 * DAY, now + 1, None)?
+        .into_iter()
+        .map(|c| {
+            Ok(CandidateRow {
+                title: candidate_title(cfg, &c),
+                summary: crate::publish::summary(cfg, &c),
+                evidence: evidence::gather(&db, cfg, &c)?.lines(cfg),
+                candidate: c,
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let reports = rain::latest(&db)?;
+    let (radar, heard): (Vec<&Report>, Vec<&Report>) = reports
+        .iter()
+        .partition(|r| r.source == crate::radar::SOURCE);
+    let near = |station: &str| -> Vec<String> {
+        cfg.sites
+            .iter()
+            .filter(|s| s.aprs.iter().chain(&s.nws).any(|x| x == station))
+            .map(|s| s.node.clone())
+            .collect()
+    };
+    let mut gauges: Vec<Gauge> = heard
+        .iter()
+        .map(|r| Gauge {
+            station: r.station.clone(),
+            source: r.source.clone(),
+            sites: near(&r.station),
+            at_ms: Some(r.ts),
+            said: report_text(r),
+        })
+        .collect();
+    let aprs = cfg.aprs_stations().into_iter().map(|s| ("aprs", s));
+    let set = aprs.chain(cfg.nws_stations().into_iter().map(|s| ("nws", s)));
+    for (source, station) in set {
+        if !gauges
+            .iter()
+            .any(|g| g.source == source && g.station == station)
+        {
+            gauges.push(Gauge {
+                sites: near(&station),
+                station,
+                source: source.into(),
+                at_ms: None,
+                said: String::new(),
+            });
+        }
+    }
+    let max_h = cfg.sounding_height();
+    let mut soundings: Vec<SoundingRow> = sounding::latest(&db)?
+        .iter()
+        .map(|s| SoundingRow {
+            station: s.station.clone(),
+            at_ms: Some(s.ts),
+            summary: Some(s.summary(max_h)),
+        })
+        .collect();
+    for station in cfg.soundings.iter().flat_map(|s| &s.stations) {
+        if !soundings.iter().any(|s| &s.station == station) {
+            soundings.push(SoundingRow {
+                station: station.clone(),
+                at_ms: None,
+                summary: None,
+            });
+        }
+    }
+    Ok(Overview {
+        generated_ms: now,
+        here: app.here(),
+        labels: cfg
+            .sites
+            .iter()
+            .filter_map(|s| Some((s.node.clone(), s.label.clone()?)))
+            .collect(),
+        analyzed_ms: *app.analyzed.lock().unwrap(),
+        publish: cfg.publish,
+        publishing: app.publishing,
+        departure_db: cfg.duct.departure_db,
+        min_days: cfg.baseline.min_days,
+        now: now::current(&db, cfg, now, &hist)?,
+        links: rows.into_values().collect(),
+        new_more: new.len().saturating_sub(NEW_SHOWN),
+        new_links: new
+            .into_iter()
+            .take(NEW_SHOWN)
+            .map(|l| NewLink {
+                a: l.pair.0.clone(),
+                b: l.pair.1.clone(),
+                length_km: l.km.map(|k| evidence::round(k, 1)),
+                first_ms: l.first,
+                long: l.long(cfg),
+                studied: l.studied,
+            })
+            .collect(),
+        candidates,
+        gauges,
+        radar_on: cfg.radar.is_some(),
+        radar: radar_hour(&radar),
+        soundings,
+        problems: app
+            .problems()
+            .into_iter()
+            .map(|(source, at_ms, what)| Problem {
+                source,
+                at_ms,
+                what,
+            })
+            .collect(),
+    })
+}
+
+/// How long a worked-out overview is served again: each one reads every link's history,
+/// and several `top`s polling at once mustn't each redo it.
+const OVERVIEW_FOR: i64 = 5_000;
+
+/// The overview as JSON, worked out at most every `OVERVIEW_FOR` and one request at a time.
+fn overview_cached(app: &App, now: i64) -> anyhow::Result<String> {
+    // held while working, so a request that comes in meanwhile waits and takes this one
+    let mut cached = app.overview.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, json)) = cached.as_ref()
+        && (0..OVERVIEW_FOR).contains(&(now - at))
+    {
+        return Ok(json.clone());
+    }
+    let json = serde_json::to_string(&overview_data(app, now)?)?;
+    *cached = Some((now, json.clone()));
+    Ok(json)
+}
+
+async fn overview_json(State(app): State<Arc<App>>) -> Result<Response, Fail> {
+    let json = tokio::task::spawn_blocking(move || overview_cached(&app, now_ms())).await??;
+    Ok(([(header::CONTENT_TYPE, "application/json")], json).into_response())
 }
 
 fn drops_html(cfg: &Config, drops: &[crate::detect::Drop]) -> String {
@@ -620,7 +922,7 @@ fn events_body(app: &App, kind: Option<&str>) -> anyhow::Result<String> {
             b,
             "<h2>{} {}</h2><p class=small>{} to {}</p>{}",
             candidate_pill(c),
-            candidate_title(cfg, c),
+            esc(&candidate_title(cfg, c)),
             esc(&when(cfg, c.start())),
             esc(&c
                 .end()
@@ -633,8 +935,11 @@ fn events_body(app: &App, kind: Option<&str>) -> anyhow::Result<String> {
 }
 
 async fn now_json(State(app): State<Arc<App>>) -> Result<axum::Json<Now>, Fail> {
-    let a = app.clone();
-    let n = tokio::task::spawn_blocking(move || now::current(&a.db(), &a.cfg, now_ms())).await??;
+    let n = tokio::task::spawn_blocking(move || {
+        let (db, now) = (app.db(), now_ms());
+        now::current(&db, &app.cfg, now, &recent_history(&db, &app.cfg, now)?)
+    })
+    .await??;
     Ok(axum::Json(n))
 }
 
@@ -1154,7 +1459,7 @@ async fn link_json(
 /// positions, with its length, whether it is new and studied, its residual if fresh and
 /// the kinds of candidate it was part of in the last day; and a point per node.
 fn layer(conn: &Connection, cfg: &Config, now: i64) -> anyhow::Result<Value> {
-    let ends = end_status(conn, cfg, now)?;
+    let ends = end_status(conn, cfg, now, &recent_history(conn, cfg, now)?)?;
     let seen = links::seen(conn, cfg, now)?;
     let nodes: BTreeSet<&String> = seen.iter().flat_map(|l| [&l.pair.0, &l.pair.1]).collect();
     let pos = evidence::positions(conn, nodes)?;
@@ -1533,7 +1838,10 @@ mod tests {
     const T0: i64 = 1_795_000_000_000 - 1_795_000_000_000 % DAY;
 
     fn fake() -> Fake {
-        let f = Fake::new(vec![Box::new(Mesh) as Box<dyn Projection>]);
+        let f = Fake::new(vec![
+            Box::new(Mesh) as Box<dyn Projection>,
+            Box::new(crate::strikes::Strikes),
+        ]);
         for s in [
             series::SCHEMA,
             rain::SCHEMA,
@@ -1625,7 +1933,8 @@ mod tests {
         let now = T0 + 19 * DAY + 15 * HOUR + 40 * MIN;
         poll(&mut f, "TST-HUB", "TST-N1", now - 5 * MIN, 35.3, -120.6);
         poll(&mut f, "TST-N1", "TST-HUB", now - 5 * MIN, 35.4, -120.7);
-        let ends = end_status(&f.conn, &cfg, now).unwrap();
+        let hist = recent_history(&f.conn, &cfg, now).unwrap();
+        let ends = end_status(&f.conn, &cfg, now, &hist).unwrap();
         assert_eq!(ends.len(), 2);
         for e in &ends {
             assert_eq!(e.baseline_days, 19);
@@ -1641,5 +1950,227 @@ mod tests {
             assert_eq!(d.baseline.last().map(|b| b.1), Some(-60.0), "{:?}", d.end);
             assert_eq!(d.residual.last().map(|r| r.1), Some(0.0), "{:?}", d.end);
         }
+    }
+
+    #[test]
+    fn the_overview_has_each_link_once_and_every_source_set_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg: Config = toml::from_str(&format!(
+            "data_dir = {:?}\npublish = false\nlinks = [[\"tst-hub\", \"tst-n1\"]]\n[aprs]\n\
+             [radar]\n[soundings]\nstations = [\"72393\"]\n[[site]]\nnode = \"tst-hub\"\n\
+             label = \"Hub Peak\"\naprs = [\"N0CALL-13\", \"N0CALL-14\"]",
+            dir.path()
+        ))
+        .unwrap();
+        cfg.validate().unwrap();
+        let mut f = fake();
+        let now = T0 + 10 * MIN;
+        // heard for three days, so a link that turns up now is new
+        f.conn
+            .execute(
+                "INSERT INTO link_hours (node, neighbor, hour, n, signal) VALUES ('tst-hub', 'tst-n1', ?1, 12, -60)",
+                params![now - 3 * DAY - now % HOUR],
+            )
+            .unwrap();
+        poll(&mut f, "TST-HUB", "TST-N1", now - 5 * MIN, 35.0, -120.5);
+        poll(&mut f, "TST-N1", "TST-HUB", now - 4 * MIN, 35.2, -120.7);
+        poll(&mut f, "TST-N2", "TST-HUB", now - 50 * MIN, 35.3, -120.5);
+        let r = Report {
+            source: "aprs".into(),
+            station: "N0CALL-13".into(),
+            ts: now - 3 * MIN,
+            rain_1h_mm: Some(1.5),
+            ..Default::default()
+        };
+        rain::store(&f.conn, &r).unwrap();
+        let radar = Report {
+            source: crate::radar::SOURCE.into(),
+            station: "tst-hub".into(),
+            ts: now - 20 * MIN,
+            rain_1h_mm: Some(3.0),
+            ..Default::default()
+        };
+        rain::store(&f.conn, &radar).unwrap();
+        let drop = crate::detect::Drop {
+            a: "tst-hub".into(),
+            b: "tst-n1".into(),
+            start: now - 2 * HOUR,
+            end: Some(now - HOUR),
+            last_low: now - HOUR - 10 * MIN,
+            depth: 3.0,
+        };
+        let wet = Candidate::Wet(crate::detect::Wet {
+            site: "tst-hub".into(),
+            start: drop.start,
+            end: drop.end,
+            drops: vec![drop],
+            site_links: 1,
+            others: 0,
+            others_dropping: 0,
+        });
+        f.conn
+            .execute(
+                "INSERT INTO events (kind, start, end, site, detail) VALUES ('wet', ?1, ?2, 'tst-hub', ?3)",
+                params![wet.start(), wet.end(), serde_json::to_string(&wet).unwrap()],
+            )
+            .unwrap();
+        let app = App::new(cfg).unwrap();
+        *app.db() = f.conn;
+        app.failed("aprs", "APRS-IS 127.0.0.1:9: connection refused");
+        *app.analyzed.lock().unwrap() = Some(now - MIN);
+
+        let o = overview_data(&app, now).unwrap();
+        // top reads it back through the same types
+        let o: Overview = serde_json::from_str(&serde_json::to_string(&o).unwrap()).unwrap();
+        assert_eq!(o.links.len(), 1, "both directions of one link");
+        let l = &o.links[0];
+        let heard: Vec<(&str, &str)> = l
+            .ends
+            .iter()
+            .map(|e| (e.node.as_str(), e.hears.as_str()))
+            .collect();
+        assert_eq!((l.a.as_str(), l.b.as_str()), ("tst-hub", "tst-n1"));
+        assert_eq!(heard, [("tst-hub", "tst-n1"), ("tst-n1", "tst-hub")]);
+        assert_eq!(l.ends[1].last_ms, now - 4 * MIN);
+        assert_eq!(l.ends[0].residual_db, None, "no history, no baseline");
+        assert!((l.length_km.unwrap() - 28.7).abs() < 0.3);
+        let gauges: Vec<(&str, Option<i64>, &str)> = o
+            .gauges
+            .iter()
+            .map(|g| (g.station.as_str(), g.at_ms, g.said.as_str()))
+            .collect();
+        assert_eq!(
+            gauges,
+            [
+                ("N0CALL-13", Some(now - 3 * MIN), "1.5 mm in the last hour"),
+                ("N0CALL-14", None, ""),
+            ],
+            "a station set up but never heard is listed too"
+        );
+        assert_eq!(o.gauges[0].sites, ["tst-hub"]);
+        assert_eq!(o.soundings.len(), 1);
+        assert_eq!(
+            (o.soundings[0].station.as_str(), o.soundings[0].at_ms),
+            ("72393", None)
+        );
+        assert!(o.radar_on);
+        assert_eq!(
+            o.radar,
+            Some(RadarHour {
+                at_ms: now - 20 * MIN,
+                sites: 1,
+                wet_sites: 1,
+                max_mm: Some(3.0)
+            })
+        );
+        assert_eq!(o.analyzed_ms, Some(now - MIN));
+        let new: Vec<(&str, &str, i64, bool, bool)> = o
+            .new_links
+            .iter()
+            .map(|l| (l.a.as_str(), l.b.as_str(), l.first_ms, l.long, l.studied))
+            .collect();
+        assert_eq!(
+            new,
+            [("tst-hub", "tst-n2", now - 50 * MIN, true, false)],
+            "new, 33 km long, and not one of `links`"
+        );
+        assert!((o.new_links[0].length_km.unwrap() - 33.4).abs() < 0.2);
+        assert_eq!(o.new_more, 0);
+        assert_eq!(o.problems.len(), 1);
+        assert_eq!(o.problems[0].source, "aprs");
+        assert_eq!(o.labels["tst-hub"], "Hub Peak");
+        assert_eq!(o.candidates.len(), 1);
+        let c = &o.candidates[0];
+        assert_eq!(c.title, "Wet antenna? at Hub Peak");
+        assert!(
+            c.evidence.iter().any(|e| e.contains("N0CALL-13")),
+            "{:?}",
+            c.evidence
+        );
+        assert_eq!(o.now.state, crate::now::State::Unknown);
+        assert!(!o.publish && !o.publishing);
+
+        // served again for a few seconds, then worked out afresh
+        let first = overview_cached(&app, now).unwrap();
+        app.failed(
+            "radar",
+            "radar (MRMS): example.org answered 503 Service Unavailable",
+        );
+        assert_eq!(
+            overview_cached(&app, now + OVERVIEW_FOR - 1).unwrap(),
+            first
+        );
+        let later = overview_cached(&app, now + OVERVIEW_FOR).unwrap();
+        assert!(later.contains("answered 503"), "{later}");
+    }
+
+    #[tokio::test]
+    async fn site_labels_are_escaped_on_the_front_and_events_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg: Config = toml::from_str(&format!(
+            "data_dir = {:?}\npublish = false\n[[site]]\nnode = \"tst-hub\"\nlabel = \"<b>Hub</b>\"",
+            dir.path()
+        ))
+        .unwrap();
+        cfg.validate().unwrap();
+        let app = App::new(cfg).unwrap();
+        let start = now_ms() - 2 * HOUR;
+        let wet = Candidate::Wet(crate::detect::Wet {
+            site: "tst-hub".into(),
+            start,
+            end: Some(start + HOUR),
+            drops: vec![],
+            site_links: 2,
+            others: 0,
+            others_dropping: 0,
+        });
+        app.db()
+            .execute(
+                "INSERT INTO events (kind, start, end, site, detail) VALUES ('wet', ?1, ?2, 'tst-hub', ?3)",
+                params![wet.start(), wet.end(), serde_json::to_string(&wet).unwrap()],
+            )
+            .unwrap();
+        let app = Arc::new(app);
+        let Ok(Html(front)) = overview(State(app.clone())).await else {
+            panic!("the front page failed");
+        };
+        let events = events_body(&app, None).unwrap();
+        for (name, page) in [("front", front), ("events", events)] {
+            assert!(
+                page.contains("Wet antenna? at &lt;b&gt;Hub&lt;/b&gt;"),
+                "{name}: {page}"
+            );
+            assert!(!page.contains("<b>Hub</b>"), "{name} lets markup through");
+        }
+    }
+
+    #[test]
+    fn the_radar_row_is_the_newest_hour_over_every_site() {
+        let at = |site: &str, ts: i64, mm: f64| Report {
+            source: crate::radar::SOURCE.into(),
+            station: site.into(),
+            ts,
+            rain_1h_mm: Some(mm),
+            ..Default::default()
+        };
+        let reports = [
+            at("tst-hub", T0, 3.0),
+            at("tst-n1", T0, 0.0),
+            at("tst-n2", T0, 5.1),
+            at("tst-hub", T0 - HOUR, 9.0),
+        ];
+        let refs: Vec<&Report> = reports.iter().collect();
+        assert_eq!(
+            radar_hour(&refs),
+            Some(RadarHour {
+                at_ms: T0,
+                sites: 3,
+                wet_sites: 2,
+                max_mm: Some(5.1)
+            }),
+            "the hour before doesn't count, and a 0 isn't rain"
+        );
+        assert_eq!(radar_hour(&refs[1..2]).unwrap().max_mm, None);
+        assert_eq!(radar_hour(&[]), None);
     }
 }
